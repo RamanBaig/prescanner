@@ -175,32 +175,45 @@ function analyzeVolatility(dailyCandles, vol24hUsd = 0) {
 }
 
 // ═══════════════════════════════════════════════════════
-// SCORING SYSTEM V4.0 — Momentum & Volume Surge Priority
+// SCORING SYSTEM V4.1 — Trend Quality & Volatility Expansion
 // ═══════════════════════════════════════════════════════
-// V4.0 UPGRADE: Fixes the "AGLD problem" — coins with decent 4H history
-// but ZERO current momentum/volume were scoring nearly the same as real
-// movers like FAI/SYND. The fix: redistribute 10pts from historical
-// metrics (4H change, 4H range) INTO volume surge (5→15pts), and add
-// "stale move" + "momentum fading" penalties for sideways setups.
+// V4.1 UPGRADE: Data-driven from 56,000+ real Coinbase log entries (2025).
+// Key findings vs V4.0:
+//   - hourlyUptrend: 54% of 10%+ winners had uptrend vs only 26% of losers
+//   - bbWidthPercent: winners 11.3% vs losers 4.2% (2.7x higher — volatility expanding)
+//   - vwapDeviation: winners +1.05 vs losers -0.69 (price above VWAP)
+//   - ultraShortVolumeSurge: nearly identical — sudden spikes ≠ wins, sustained surge does
+//   - "Spike: too late" penalty was too aggressive, firing on steady uptrends
 //
-// Old max: 30+20+15+15+10+5+5 = 100
-// New max: 25+15+15+15+10+5+15 = 100 (same scale, better differentiation)
+// V4.1 fixes:
+//   1. Add Component 8: Consecutive green hourly candles (max 8 pts)
+//      → Captures the "hourlyUptrend" signal: sustained buying pressure
+//   2. Add Component 9: Volatility expansion (max 5 pts)
+//      → Captures the "bbWidthPercent" signal: expanding volatility = breakout candidate
+//   3. Reduce Component 1 max 25→22 pts (3 pts redistributed to trend quality)
+//   4. Fix "Spike: too late" penalty — only fires on genuine single-candle blow-offs
+//      (requires volExpansion >= 2.5x, not just last1hChg > 2.5%)
+//   5. New penalty: mostly-red candles (trendConsistency < 25%) despite 3%+ range
+//   6. New penalty: volatility contraction after big move (volExpansion < 0.5x)
 //
-// Impact example: AGLD (sideways, 0.8x surge) ~65→~48, FAI (pumping, 2x+ surge) ~83→~82
-// Gap doubles from 18pts to 34pts — prescanner now properly separates dead from alive.
+// New max: 22+15+15+15+10+5+15+8+5 = 110 (slightly higher ceiling — better differentiation)
 function calculateMoverScore(stats) {
-    const { chg4h, range4h, vol24hUsd, momentumPct, last1hChg, avgDailyATRPct, pricePositionPct, volumeSurgeRatio } = stats;
+    const { chg4h, range4h, vol24hUsd, momentumPct, last1hChg, avgDailyATRPct, pricePositionPct, volumeSurgeRatio,
+            consecGreen, trendConsistency, volExpansion } = stats;
     let score = 0;
 
-    // ── COMPONENT 1: 4H price change (max 25 pts) — reduced from 30, past change matters less ──
-    if (chg4h >= 15) score += 25;
-    else if (chg4h >= 10) score += 23;
-    else if (chg4h >= 7) score += 21;
-    else if (chg4h >= 5) score += 18;
-    else if (chg4h >= 3) score += 15;
-    else if (chg4h >= 2) score += 12;
-    else if (chg4h >= 1) score += 8;
-    else if (chg4h >= 0.5) score += 5;
+    // Pre-compute volExpansion for use in both components and penalties
+    const vexp = volExpansion != null ? volExpansion : 1.0;
+
+    // ── COMPONENT 1: 4H price change (max 22 pts) — 3pts redistributed to trend quality ──
+    if (chg4h >= 15) score += 22;
+    else if (chg4h >= 10) score += 20;
+    else if (chg4h >= 7) score += 18;
+    else if (chg4h >= 5) score += 15;
+    else if (chg4h >= 3) score += 12;
+    else if (chg4h >= 2) score += 9;
+    else if (chg4h >= 1) score += 6;
+    else if (chg4h >= 0.5) score += 4;
     else if (chg4h >= 0) score += 2;
 
     // ── COMPONENT 2: 4H range (max 15 pts) — reduced from 20, big range alone ≠ active NOW ──
@@ -262,8 +275,26 @@ function calculateMoverScore(stats) {
     else if (surge >= 1.0) score += 3;
     else if (surge >= 0.8) score += 1;
 
+    // ── COMPONENT 8: Trend consistency — consecutive green hourly candles (max 8 pts) ──
+    // Data: hourlyUptrend present in 54% of 10%+ winners vs only 26% of losers.
+    // Multiple consecutive green hourly closes = sustained buyers — not a one-candle spike.
+    const cg = consecGreen != null ? consecGreen : 0;
+    if (cg >= 3) score += 8;
+    else if (cg >= 2) score += 5;
+    else if (cg >= 1) score += 2;
+
+    // ── COMPONENT 9: Volatility expansion — last candle bigger than average (max 5 pts) ──
+    // Data: BB width 11.3% for winners vs 4.2% for losers (2.7x). Rising per-candle
+    // range signals a volatility expansion = breakout in progress, not a dead market.
+    if (vexp >= 2.0) score += 5;
+    else if (vexp >= 1.5) score += 3;
+    else if (vexp >= 1.2) score += 1;
+
     // ── PENALTY DEDUCTIONS ──
-    if (last1hChg > 2.5 && chg4h > 0 && last1hChg > chg4h * 0.6) score -= 18; // Spike: too late
+    // V4.1 FIX: Old spike penalty fired on ANY last1hChg > 2.5% — too aggressive.
+    // It was penalizing steady uptrends (winners!). New condition requires BOTH a large
+    // last-hour move AND a single-candle blow-off (last candle 2.5x bigger than avg).
+    if (last1hChg > 3.5 && vexp >= 2.5 && chg4h > 0) score -= 18; // Spike: single-candle blow-off
     if (chg4h < -3 && last1hChg > 1) score -= 15; // Dead cat bounce
     if (chg4h > 15) score -= 10; // Overextended
     if (chg4h > 8 && last1hChg < -1) score -= 12; // Peaked
@@ -273,13 +304,21 @@ function calculateMoverScore(stats) {
 
     // ── NEW V4.0 PENALTIES — Target "looks good on paper, dead in reality" ──
     // Stale Move: Big 4H range but FLAT last hour = the move already happened.
-    // This is the AGLD scenario: range was 56% historically but 1H change ≈ 0%.
-    // The coin had a nice setup earlier but now it's just consolidating sideways.
     if (range4h >= 5 && Math.abs(last1hChg) < 0.5) score -= 10;
 
     // Momentum Fading: 4H was positive but last hour reversed — move is dying.
     // Only fires in mid-range (chg4h 3-8%). The "Peaked" penalty covers > 8%.
     if (chg4h >= 3 && chg4h <= 8 && last1hChg < -0.5) score -= 6;
+
+    // ── NEW V4.1 PENALTIES — Trend quality ──
+    // Downtrend disguised: coin has 3%+ range but ≥75% of hourly candles are red.
+    // Means the range came from a DROP, not a pump — wrong direction entirely.
+    const tc = trendConsistency != null ? trendConsistency : 0.5;
+    if (tc < 0.25 && range4h >= 3) score -= 10; // Mostly red candles — actual downtrend
+
+    // Volatility contraction after move: last candle is much smaller than average.
+    // Range still looks nice from earlier but momentum is clearly dying right now.
+    if (vexp < 0.5 && range4h >= 5) score -= 5; // Volatility dying after big move
 
     return Math.max(0, score);
 }
@@ -523,6 +562,27 @@ async function scanAllCoins({ maxCoins = 30, minVolume = 300000, minScore = 15, 
             const avg4hVol = coin.vol24hUsd / 6; // 24h / 6 = one 4h block
             const volumeSurgeRatio = avg4hVol > 0 ? Math.round((vol4hUsd / avg4hVol) * 100) / 100 : 1;
 
+            // ── V4.1 METRICS: Trend quality from hourly candles ──
+            // Consecutive green hourly closes from the latest candle backwards
+            let consecGreen = 0;
+            for (let i = candles.length - 1; i >= 0; i--) {
+                if (candles[i].close >= candles[i].open) consecGreen++;
+                else break;
+            }
+
+            // Trend consistency: what fraction of the hourly candles are green
+            const greenCount = candles.filter(c => c.close >= c.open).length;
+            const trendConsistency = candles.length > 0 ? Math.round((greenCount / candles.length) * 1000) / 1000 : 0.5;
+
+            // Volatility expansion: is the most recent candle bigger than the average of previous candles?
+            // High ratio = volatility expanding (breakout starting). Low ratio = volatility dying.
+            const prevCandles = candles.slice(0, -1);
+            const avgPrevRange = prevCandles.length > 0
+                ? prevCandles.reduce((sum, c) => sum + (c.high - c.low), 0) / prevCandles.length
+                : 0;
+            const lastCandleRange = newest.high - newest.low;
+            const volExpansion = avgPrevRange > 0 ? Math.round((lastCandleRange / avgPrevRange) * 100) / 100 : 1.0;
+
             return {
                 ...coin,
                 chg4h,
@@ -534,6 +594,9 @@ async function scanAllCoins({ maxCoins = 30, minVolume = 300000, minScore = 15, 
                 open4h,
                 close4h,
                 volumeSurgeRatio,
+                consecGreen,
+                trendConsistency,
+                volExpansion,
             };
         } catch (err) {
             return null;
@@ -665,9 +728,9 @@ async function scanAllCoins({ maxCoins = 30, minVolume = 300000, minScore = 15, 
     if (verbose) {
         const totalElapsed = ((Date.now() - startTime) / 1000).toFixed(1);
         console.log(`\n  🏆 Top ${topCoins.length} coins selected (score >= ${minScore}) in ${totalElapsed}s total:`);
-        console.log('  ' + '─'.repeat(155));
-        console.log('  Rank  Symbol      Score   ATR%  ReqATR  MaxDay  Pos%   4H Chg    4H Range   1H Chg   VolSurge   Vol (USD)   Slip    Price');
-        console.log('  ' + '─'.repeat(155));
+        console.log('  ' + '─'.repeat(175));
+        console.log('  Rank  Symbol      Score   ATR%  ReqATR  MaxDay  Pos%   4H Chg    4H Range   1H Chg   VolSurge  Trnd  VExp   Vol (USD)   Slip    Price');
+        console.log('  ' + '─'.repeat(175));
         for (let i = 0; i < topCoins.length; i++) {
             const r = topCoins[i];
             const volStr = r.vol24hUsd > 1e6
@@ -682,6 +745,8 @@ async function scanAllCoins({ maxCoins = 30, minVolume = 300000, minScore = 15, 
             const maxDayStr = r.maxDailyRangePct != null ? r.maxDailyRangePct.toFixed(1) + '%' : 'N/A';
             const posStr = r.pricePositionPct != null ? r.pricePositionPct.toFixed(0) + '%' : 'N/A';
             const surgeStr = r.volumeSurgeRatio != null ? r.volumeSurgeRatio.toFixed(1) + 'x' : 'N/A';
+            const trendStr = r.consecGreen != null ? `${r.consecGreen}↑` : 'N/A';
+            const vexpStr = r.volExpansion != null ? r.volExpansion.toFixed(1) + 'x' : 'N/A';
             console.log(
                 '  ' + String(i + 1).padStart(4) + '  ' +
                 r.symbol.padEnd(12) +
@@ -694,12 +759,14 @@ async function scanAllCoins({ maxCoins = 30, minVolume = 300000, minScore = 15, 
                 rangeStr.padStart(9) + '  ' +
                 chg1hStr.padStart(8) + '  ' +
                 surgeStr.padStart(8) + '  ' +
+                trendStr.padStart(4) + '  ' +
+                vexpStr.padStart(4) + '  ' +
                 volStr.padStart(10) + '  ' +
                 slipStr.padStart(7) + '  ' +
                 String(r.last)
             );
         }
-        console.log('  ' + '─'.repeat(155));
+        console.log('  ' + '─'.repeat(175));
     }
 
     // Return in the format loadTokensFromPrescanner expects
@@ -717,6 +784,9 @@ async function scanAllCoins({ maxCoins = 30, minVolume = 300000, minScore = 15, 
         pricePositionPct: r.pricePositionPct,
         volumeSurgeRatio: r.volumeSurgeRatio,
         volatileDays: r.volatileDays,
+        consecGreen: r.consecGreen,
+        trendConsistency: r.trendConsistency,
+        volExpansion: r.volExpansion,
     }));
 }
 
@@ -730,7 +800,7 @@ if (require.main === module) {
     const minScore = parseInt(args.find(a => a.startsWith('--min-score='))?.split('=')[1]) || 15;
 
     console.log('═'.repeat(80));
-    console.log('PRESCANNER V4.0 — Momentum & Volume Surge Priority (fixes AGLD-type sideways)');
+    console.log('PRESCANNER V4.1 — Trend Quality & Volatility Expansion (data-driven from 56K+ logs)');
     console.log('═'.repeat(80));
     console.log(`Config: max=${maxCoins} coins, minVol=$${(minVol/1000).toFixed(0)}K, minScore=${minScore}`);
     console.log(`Gates:  baseATR=${BASE_ATR_REQ}%, scale=${VOL_SCALE_FACTOR}/2x vol, explosiveDay=${EXPLOSIVE_DAY_PCT}%, minBestDay=${MIN_BEST_DAY_RANGE_PCT}%\n`);
