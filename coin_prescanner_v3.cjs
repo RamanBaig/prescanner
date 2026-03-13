@@ -175,31 +175,27 @@ function analyzeVolatility(dailyCandles, vol24hUsd = 0) {
 }
 
 // ═══════════════════════════════════════════════════════
-// SCORING SYSTEM V4.1 — Trend Quality & Volatility Expansion
+// SCORING SYSTEM V4.2 — VWAP Position & OBV Direction
 // ═══════════════════════════════════════════════════════
-// V4.1 UPGRADE: Data-driven from 56,000+ real Coinbase log entries (2025).
-// Key findings vs V4.0:
-//   - hourlyUptrend: 54% of 10%+ winners had uptrend vs only 26% of losers
-//   - bbWidthPercent: winners 11.3% vs losers 4.2% (2.7x higher — volatility expanding)
-//   - vwapDeviation: winners +1.05 vs losers -0.69 (price above VWAP)
-//   - ultraShortVolumeSurge: nearly identical — sudden spikes ≠ wins, sustained surge does
-//   - "Spike: too late" penalty was too aggressive, firing on steady uptrends
+// V4.1 findings (56K logs): hourlyUptrend 54% winners vs 26% losers, bbWidth 2.7x, vwapDev huge.
+// V4.2 deeper analysis (19K data points, all 12 months):
+//   Peak tier analysis (peak 3-5% → 5-10% → 10-15% → 15-25% → 25%+):
+//   - priceAboveVWAP: 38%  → 41%  → 46%  → 56%  → 58%   (monotonic — bullish momentum confirmation)
+//   - OBV up (upVol>downVol): 42% → 46% → 56% → 57% → 72% (monotonic — buyers in control of volume)
+//   Both computable from OHLCV candle data already fetched. No extra API calls needed.
 //
-// V4.1 fixes:
-//   1. Add Component 8: Consecutive green hourly candles (max 8 pts)
-//      → Captures the "hourlyUptrend" signal: sustained buying pressure
-//   2. Add Component 9: Volatility expansion (max 5 pts)
-//      → Captures the "bbWidthPercent" signal: expanding volatility = breakout candidate
-//   3. Reduce Component 1 max 25→22 pts (3 pts redistributed to trend quality)
-//   4. Fix "Spike: too late" penalty — only fires on genuine single-candle blow-offs
-//      (requires volExpansion >= 2.5x, not just last1hChg > 2.5%)
-//   5. New penalty: mostly-red candles (trendConsistency < 25%) despite 3%+ range
-//   6. New penalty: volatility contraction after big move (volExpansion < 0.5x)
+// V4.2 additions:
+//   1. Add Component 10: Price above 4H VWAP (max 4 pts)
+//      → Computed from hourly candle OHLCV: typical price × volume weighted average
+//   2. Add Component 11: OBV bullish direction (max 4 pts)
+//      → upVol (green candles) > downVol (red candles) in the 4H window
+//   3. Strengthen low-vol squeeze penalty: range < 3% + volExpansion < 0.8 → -5 pts
+//      → bbSqueeze: only 15.5% of winners vs 46.8% of losers have it. Extra penalty needed.
 //
-// New max: 22+15+15+15+10+5+15+8+5 = 110 (slightly higher ceiling — better differentiation)
+// New max: 22+15+15+15+10+5+15+8+5+4+4 = 118 (slightly higher ceiling for better differentiation)
 function calculateMoverScore(stats) {
     const { chg4h, range4h, vol24hUsd, momentumPct, last1hChg, avgDailyATRPct, pricePositionPct, volumeSurgeRatio,
-            consecGreen, trendConsistency, volExpansion } = stats;
+            consecGreen, trendConsistency, volExpansion, priceAboveVwap4h, obvBullish4h } = stats;
     let score = 0;
 
     // Pre-compute volExpansion for use in both components and penalties
@@ -290,6 +286,17 @@ function calculateMoverScore(stats) {
     else if (vexp >= 1.5) score += 3;
     else if (vexp >= 1.2) score += 1;
 
+    // ── COMPONENT 10: Price above 4H VWAP (max 4 pts) ──
+    // Data: AboveVWAP % rises monotonically from 38% (3-5% peaks) to 58% (25%+ peaks).
+    // Price above VWAP = buyers in control, momentum confirmed, not a dead bounce.
+    if (priceAboveVwap4h) score += 4;
+
+    // ── COMPONENT 11: OBV direction — up-candle vol > down-candle vol (max 4 pts) ──
+    // Data: OBV bullish % rises monotonically from 42% (3-5% peaks) to 72% (25%+ peaks).
+    // Strongest signal at the high end: 72% of 25%+ winners have more volume on up candles.
+    // This captures the difference between "choppy random" and "actively being bought."
+    if (obvBullish4h) score += 4;
+
     // ── PENALTY DEDUCTIONS ──
     // V4.1 FIX: Old spike penalty fired on ANY last1hChg > 2.5% — too aggressive.
     // It was penalizing steady uptrends (winners!). New condition requires BOTH a large
@@ -319,6 +326,11 @@ function calculateMoverScore(stats) {
     // Volatility contraction after move: last candle is much smaller than average.
     // Range still looks nice from earlier but momentum is clearly dying right now.
     if (vexp < 0.5 && range4h >= 5) score -= 5; // Volatility dying after big move
+
+    // ── V4.2: Strengthened low-volatility (squeeze) penalty ──
+    // bbSqueeze only 15.5% of winners vs 46.8% of losers. A quiet market with no expansion
+    // is a consolidation zone — too early or too late. Double-penalize the squeeze zone.
+    if (range4h < 3 && vexp < 0.8) score -= 5; // Dead/consolidating — nothing happening right now
 
     return Math.max(0, score);
 }
@@ -583,6 +595,22 @@ async function scanAllCoins({ maxCoins = 30, minVolume = 300000, minScore = 15, 
             const lastCandleRange = newest.high - newest.low;
             const volExpansion = avgPrevRange > 0 ? Math.round((lastCandleRange / avgPrevRange) * 100) / 100 : 1.0;
 
+            // ── V4.2 METRICS: Price vs VWAP and OBV direction ──
+            // Data shows monotonic gradient: VWAP above = 38%→58% and OBV bullish = 42%→72%
+            // as peak tier goes from 3-5% up to 25%+. Computable from candle OHLCV data.
+
+            // VWAP from 4H hourly candles (typical price = (H+L+C)/3 weighted by volume)
+            const vwapNumerator = candles.reduce((sum, c) => sum + ((c.high + c.low + c.close) / 3) * (c.volume || 0), 0);
+            const vwapDenominator = candles.reduce((sum, c) => sum + (c.volume || 0), 0);
+            const vwap4h = vwapDenominator > 0 ? vwapNumerator / vwapDenominator : newest.close;
+            const priceAboveVwap4h = newest.close > vwap4h;
+
+            // OBV direction from 4H hourly candles: is up-candle volume > down-candle volume?
+            // More volume on up candles = buyers in control. From data: 72% of 25%+ winners vs 42% of losers.
+            const upVol = candles.filter(c => c.close >= c.open).reduce((sum, c) => sum + (c.volume || 0), 0);
+            const downVol = candles.filter(c => c.close < c.open).reduce((sum, c) => sum + (c.volume || 0), 0);
+            const obvBullish4h = upVol > downVol;
+
             return {
                 ...coin,
                 chg4h,
@@ -597,6 +625,8 @@ async function scanAllCoins({ maxCoins = 30, minVolume = 300000, minScore = 15, 
                 consecGreen,
                 trendConsistency,
                 volExpansion,
+                priceAboveVwap4h,
+                obvBullish4h,
             };
         } catch (err) {
             return null;
@@ -728,9 +758,9 @@ async function scanAllCoins({ maxCoins = 30, minVolume = 300000, minScore = 15, 
     if (verbose) {
         const totalElapsed = ((Date.now() - startTime) / 1000).toFixed(1);
         console.log(`\n  🏆 Top ${topCoins.length} coins selected (score >= ${minScore}) in ${totalElapsed}s total:`);
-        console.log('  ' + '─'.repeat(175));
-        console.log('  Rank  Symbol      Score   ATR%  ReqATR  MaxDay  Pos%   4H Chg    4H Range   1H Chg   VolSurge  Trnd  VExp   Vol (USD)   Slip    Price');
-        console.log('  ' + '─'.repeat(175));
+        console.log('  ' + '─'.repeat(195));
+        console.log('  Rank  Symbol      Score   ATR%  ReqATR  MaxDay  Pos%   4H Chg    4H Range   1H Chg   VolSurge  Trnd  VExp  VWAP  OBV    Vol (USD)   Slip    Price');
+        console.log('  ' + '─'.repeat(195));
         for (let i = 0; i < topCoins.length; i++) {
             const r = topCoins[i];
             const volStr = r.vol24hUsd > 1e6
@@ -747,6 +777,8 @@ async function scanAllCoins({ maxCoins = 30, minVolume = 300000, minScore = 15, 
             const surgeStr = r.volumeSurgeRatio != null ? r.volumeSurgeRatio.toFixed(1) + 'x' : 'N/A';
             const trendStr = r.consecGreen != null ? `${r.consecGreen}↑` : 'N/A';
             const vexpStr = r.volExpansion != null ? r.volExpansion.toFixed(1) + 'x' : 'N/A';
+            const vwapStr = r.priceAboveVwap4h ? '↑' : '↓';
+            const obvStr = r.obvBullish4h ? '↑' : '↓';
             console.log(
                 '  ' + String(i + 1).padStart(4) + '  ' +
                 r.symbol.padEnd(12) +
@@ -761,12 +793,14 @@ async function scanAllCoins({ maxCoins = 30, minVolume = 300000, minScore = 15, 
                 surgeStr.padStart(8) + '  ' +
                 trendStr.padStart(4) + '  ' +
                 vexpStr.padStart(4) + '  ' +
+                vwapStr.padStart(4) + '  ' +
+                obvStr.padStart(3) + '  ' +
                 volStr.padStart(10) + '  ' +
                 slipStr.padStart(7) + '  ' +
                 String(r.last)
             );
         }
-        console.log('  ' + '─'.repeat(175));
+        console.log('  ' + '─'.repeat(195));
     }
 
     // Return in the format loadTokensFromPrescanner expects
@@ -787,6 +821,8 @@ async function scanAllCoins({ maxCoins = 30, minVolume = 300000, minScore = 15, 
         consecGreen: r.consecGreen,
         trendConsistency: r.trendConsistency,
         volExpansion: r.volExpansion,
+        priceAboveVwap4h: r.priceAboveVwap4h,
+        obvBullish4h: r.obvBullish4h,
     }));
 }
 
@@ -800,7 +836,7 @@ if (require.main === module) {
     const minScore = parseInt(args.find(a => a.startsWith('--min-score='))?.split('=')[1]) || 15;
 
     console.log('═'.repeat(80));
-    console.log('PRESCANNER V4.1 — Trend Quality & Volatility Expansion (data-driven from 56K+ logs)');
+    console.log('PRESCANNER V4.2 — VWAP Position & OBV Direction (data-driven from 19K+ backtest points)');
     console.log('═'.repeat(80));
     console.log(`Config: max=${maxCoins} coins, minVol=$${(minVol/1000).toFixed(0)}K, minScore=${minScore}`);
     console.log(`Gates:  baseATR=${BASE_ATR_REQ}%, scale=${VOL_SCALE_FACTOR}/2x vol, explosiveDay=${EXPLOSIVE_DAY_PCT}%, minBestDay=${MIN_BEST_DAY_RANGE_PCT}%\n`);
